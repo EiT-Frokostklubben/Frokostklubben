@@ -22,46 +22,71 @@ struct ContentView: View {
                     // Detected label (top-left)
                     Text(camera.detectedLabel)
                         .padding(10)
-                        .background(.ultraThinMaterial)
+                        .background(.black.opacity(0.7))
+                        .foregroundStyle(.white)
                         .cornerRadius(12)
                         .padding(.leading, 12)
                         .padding(.top, 12)
+                        .accessibilityLabel("Detected object")
+                        .accessibilityValue(camera.detectedLabel)
 
                     Spacer()
 
-                    // Test Sound button (top-right)
-                    Button("Test Sound") {
-                        camera.testSpeak()
+                    // Controls (top-right)
+                    HStack(spacing: 8) {
+                        Button(camera.isDetectionEnabled ? "Stop" : "Start") {
+                            camera.isDetectionEnabled.toggle()
+                        }
+                        .padding(10)
+                        .background(.black.opacity(0.7))
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                        .accessibilityLabel(camera.isDetectionEnabled ? "Stop detection" : "Start detection")
+                        .accessibilityHint("Toggles real time object detection")
+
+                        Button("Read Poster") {
+                            camera.readPoster()
+                        }
+                        .padding(10)
+                        .background(.black.opacity(0.7))
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                        .accessibilityLabel("Read poster")
+                        .accessibilityHint("Captures and reads text aloud")
+
+                        Button("Test Sound") {
+                            camera.testSpeak()
+                        }
+                        .padding(10)
+                        .background(.black.opacity(0.7))
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                        .accessibilityLabel("Test sound")
+                        .accessibilityHint("Plays a short audio message")
                     }
-                    .padding(10)
-                    .background(.ultraThinMaterial)
-                    .cornerRadius(12)
                     .padding(.trailing, 12)
                     .padding(.top, 12)
                 }
 
                 Spacer()
 
-                // Capture button (bottom)
-                Button(action: {
-                    camera.takePhoto()
-                }) {
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 72, height: 72)
-                        .overlay(
-                            Circle().stroke(Color.black.opacity(0.8), lineWidth: 2)
-                        )
-                        .shadow(radius: 4)
+                if camera.isReadingPoster {
+                    Text("Reading poster…")
+                        .padding(12)
+                        .background(.black.opacity(0.7))
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                        .padding(.bottom, 24)
+                        .accessibilityLabel("Reading poster")
                 }
-                .padding(.bottom, 40)
             }
 
             // Loading overlay
             if camera.isAuthorized && !camera.isSessionRunning && camera.capturedImage == nil {
                 Text("Starting camera…")
                     .padding()
-                    .background(.ultraThinMaterial)
+                    .background(.black.opacity(0.7))
+                    .foregroundStyle(.white)
                     .cornerRadius(12)
                     .padding()
                     .transition(.opacity)
@@ -72,6 +97,7 @@ struct ContentView: View {
                 VStack(spacing: 12) {
                     Text("Camera access is required")
                         .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
 
                     Text("Enable camera permission to use PathPilot.")
                         .font(.subheadline)
@@ -81,29 +107,33 @@ struct ContentView: View {
                         camera.requestPermissionAndStart()
                     }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityHint("Allows camera access to start detection")
                 }
                 .padding()
-                .background(.ultraThinMaterial)
+                .background(.black.opacity(0.7))
+                .foregroundStyle(.white)
                 .cornerRadius(16)
                 .padding()
             }
 
-            // Photo overlay
-            if let image = camera.capturedImage {
+            // Poster text overlay (for sighted debugging)
+            if !camera.posterText.isEmpty {
                 ZStack {
                     Color.black.opacity(0.6)
                         .ignoresSafeArea()
 
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .padding()
+                    ScrollView {
+                        Text(camera.posterText)
+                            .foregroundStyle(.white)
+                            .padding()
+                            .multilineTextAlignment(.leading)
+                    }
 
                     VStack {
                         HStack {
                             Spacer()
                             Button {
-                                camera.capturedImage = nil
+                                camera.posterText = ""
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .font(.system(size: 34))
@@ -132,5 +162,4 @@ struct ContentView: View {
 #Preview {
     ContentView()
 }
-
 

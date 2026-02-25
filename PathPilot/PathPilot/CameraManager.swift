@@ -9,37 +9,51 @@ import AVFoundation
 import SwiftUI
 import Combine
 
+@MainActor
 final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     @Published var isAuthorized = false
     @Published var capturedImage: UIImage? = nil
     @Published var isSessionRunning = false
     @Published var detectedLabel: String = "—"
+    @Published var isDetectionEnabled: Bool = true {
+        didSet { detectionEnabledUnsafe = isDetectionEnabled }
+    }
+    @Published var isReadingPoster: Bool = false {
+        didSet { isReadingPosterUnsafe = isReadingPoster }
+    }
+    @Published var posterText: String = ""
 
     let session = AVCaptureSession()
     private let photoOutput = AVCapturePhotoOutput()
-    private let classifier = VisionClassifier()
     private let videoOutput = AVCaptureVideoDataOutput()
-    
-    private let speechSynthesizer = AVSpeechSynthesizer()
-    private var lastSpokenObject: String = ""
-    private var lastSpokenTime = Date.distantPast
-    private let speechCooldown: TimeInterval = 3.0
-    private var lastClassificationTime = Date.distantPast
-    private let classificationInterval: TimeInterval = 0.4   // run vision 2–3x/sec
-    private let minConfidence: Float = 0.80 // 80% required to speak
-    
-    private var lastIdentifierSpoken: String = ""
-    private var stableIdentifier: String = ""
-    private var stableCount: Int = 0
+    nonisolated(unsafe) private let detector: ObjectDetector? = ObjectDetector(modelName: "yolov8n", labels: ObjectDetector.cocoLabels)
+    private let posterReader = PosterReader()
+    private let speechManager = SpeechManager()
 
-    private let stableRequiredCount = 2          // must appear 2 times in a row
-    private let speakThreshold: Float = 0.65     // 65% confidence
-
-
-
+    nonisolated(unsafe) private var lastClassificationTimeUnsafe = Date.distantPast
+    private let classificationInterval: TimeInterval = 0.55
+    nonisolated(unsafe) private let detectionQueue = DispatchQueue(label: "detection.queue")
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private var isConfigured = false
+    nonisolated(unsafe) private var detectionEnabledUnsafe: Bool = true
+    nonisolated(unsafe) private var isReadingPosterUnsafe: Bool = false
+
+    // Stability + speech gates
+    private var stableIdentifier: String = ""
+    private var stableCount: Int = 0
+    private let stableRequiredCount = 2
+    private let minAreaToSpeak: Float = 0.02
+
+    private let priorityWeights: [String: Float] = [
+        "person": 3.0,
+        "car": 2.0,
+        "bus": 2.0,
+        "truck": 1.8,
+        "traffic light": 1.5,
+        "chair": 1.2,
+        "bicycle": 1.2
+    ]
 
     func requestPermissionAndStart() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -63,10 +77,11 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
 
     private func startSession() {
-        sessionQueue.async {
-            DispatchQueue.main.async {
-                        self.configureAudioSession()
-                    }
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.configureAudioSession()
+            }
             if !self.isConfigured {
                 self.configureSession()
                 self.isConfigured = true
@@ -76,7 +91,7 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
             }
 
             let runningNow = self.session.isRunning
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 withAnimation(.easeOut(duration: 0.2)) {
                     self.isSessionRunning = runningNow
                 }
@@ -87,7 +102,7 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
 
     private func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .high
+        session.sessionPreset = .vga640x480
 
         guard
             let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
@@ -99,6 +114,12 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         }
 
         session.addInput(input)
+        try? device.lockForConfiguration()
+        if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && 15 <= $0.maxFrameRate }) {
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 15)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 15)
+        }
+        device.unlockForConfiguration()
 
         // Add photo output (needed for taking photos)
         if session.canAddOutput(photoOutput) {
@@ -115,45 +136,51 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         session.commitConfiguration()
     }
     
-    private func speak(_ text: String) {
-        if speechSynthesizer.isSpeaking { return }
-        
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = 0.5
-
-        speechSynthesizer.speak(utterance)
-    }
-
-    private func handleDetection(identifier: String, confidence: Float) {
-        let name = identifier.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // 1) Confidence gate
-        guard confidence >= speakThreshold else {
+    private func handleDetections(_ detections: [Detection]) {
+        let filtered = detections.filter { priorityWeights.keys.contains($0.label.lowercased()) }
+        guard let top = filtered.max(by: { score($0) < score($1) }) else {
             stableIdentifier = ""
             stableCount = 0
             return
         }
 
-        // 2) Stability gate (same label must repeat)
+        guard top.area >= minAreaToSpeak else {
+            stableIdentifier = ""
+            stableCount = 0
+            return
+        }
+
+        let name = top.label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         if name == stableIdentifier {
             stableCount += 1
         } else {
             stableIdentifier = name
             stableCount = 1
         }
-
         guard stableCount >= stableRequiredCount else { return }
 
-        // 3) Cooldown + no-repeat gate
-        let now = Date()
-        if name == lastIdentifierSpoken && now.timeIntervalSince(lastSpokenTime) <= speechCooldown { return }
+        let direction = directionFor(box: top.bbox)
+        let distance = distanceWord(for: top.area)
+        speechManager.speakEvent(label: top.label, direction: direction, distanceWord: distance, area: top.area)
+    }
 
-        lastIdentifierSpoken = name
-        lastSpokenTime = now
+    private func score(_ detection: Detection) -> Float {
+        let label = detection.label.lowercased()
+        let weight = priorityWeights[label] ?? 1.0
+        return detection.confidence * detection.area * weight
+    }
 
-        // Speak the actual label (dynamic)
-        speak("Obstacle. \(identifier).")
+    private func directionFor(box: CGRect) -> String {
+        let centerX = box.midX
+        if centerX < 0.33 { return "left" }
+        if centerX > 0.66 { return "right" }
+        return "ahead"
+    }
+
+    private func distanceWord(for area: Float) -> String {
+        if area >= 0.06 { return "very close" }
+        if area >= 0.02 { return "near" }
+        return ""
     }
 
 
@@ -170,7 +197,14 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
 //TEST
     func testSpeak() {
-        speak("Audio test. PathPilot is speaking.")
+        speechManager.speak(text: "Audio test. PathPilot is speaking.")
+    }
+
+    func readPoster() {
+        guard !isReadingPoster else { return }
+        isReadingPoster = true
+        posterText = "Reading poster..."
+        takePhoto()
     }
 
 
@@ -179,10 +213,9 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     // MARK: - Capture Photo
 
     func takePhoto() {
-        sessionQueue.async {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
             guard self.session.isRunning else { return }
-
-            // Ensure photo output has an active connection
             guard self.photoOutput.connection(with: .video) != nil else { return }
 
             let settings = AVCapturePhotoSettings()
@@ -191,71 +224,58 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
 
 
-    func captureOutput(_ output: AVCaptureOutput,
+    nonisolated func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
 
-        // Throttle to avoid lag + spam
         let now = Date()
-        guard now.timeIntervalSince(lastClassificationTime) >= classificationInterval else { return }
-        lastClassificationTime = now
+        if !detectionEnabledUnsafe || isReadingPosterUnsafe { return }
+        if now.timeIntervalSince(lastClassificationTimeUnsafe) < classificationInterval { return }
+        lastClassificationTimeUnsafe = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        classifier.classify(pixelBuffer: pixelBuffer) { [weak self] identifier, confidence in
+        detectionQueue.async { [weak self] in
             guard let self else { return }
+            guard let detector = self.detector else {
+                Task { @MainActor in self.detectedLabel = "No model loaded" }
+                return
+            }
 
-            DispatchQueue.main.async {
-                self.detectedLabel = "\(identifier) (\(Int(confidence * 100))%)"
-                self.handleDetection(identifier: identifier, confidence: confidence)
+            detector.detect(pixelBuffer: pixelBuffer) { [weak self] detections in
+                guard let self else { return }
+                Task { @MainActor in
+                    if let top = detections.max(by: { $0.confidence < $1.confidence }) {
+                        self.detectedLabel = "\(top.label) (\(Int(top.confidence * 100))%)"
+                    } else {
+                        self.detectedLabel = "—"
+                    }
+                    self.handleDetections(detections)
+                }
             }
         }
     }
-    
-    func photoOutput(_ output: AVCapturePhotoOutput,
+
+    nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         guard error == nil else { return }
         guard let data = photo.fileDataRepresentation(),
               let image = UIImage(data: data) else { return }
 
-        DispatchQueue.main.async {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             self.capturedImage = image
+            if self.isReadingPoster {
+                self.posterReader.read(image: image) { [weak self] text in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        self.posterText = text.isEmpty ? "No text found." : text
+                        self.speechManager.speak(text: self.posterText)
+                        self.isReadingPoster = false
+                    }
+                }
+            }
         }
     }
-
-
 }
-
-
-
-// SwiftUI camera preview
-struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-
-    func makeUIView(context: Context) -> PreviewView {
-        let view = PreviewView()
-        view.videoPreviewLayer.session = session
-        view.videoPreviewLayer.videoGravity = .resizeAspectFill
-
-        if let connection = view.videoPreviewLayer.connection, connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
-        }
-        return view
-    }
-
-    func updateUIView(_ uiView: PreviewView, context: Context) {
-        // Nothing needed; PreviewView keeps the layer sized correctly.
-    }
-}
-
-final class PreviewView: UIView {
-    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var videoPreviewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        videoPreviewLayer.frame = bounds
-    }
-}
-

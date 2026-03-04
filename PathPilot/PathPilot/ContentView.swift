@@ -95,7 +95,7 @@ struct ContentView: View {
             }
 
             // Loading overlay
-            if camera.isAuthorized && !camera.isSessionRunning && camera.capturedImage == nil {
+            if camera.isAuthorized && !camera.isSessionRunning {
                 Text("Starting camera…")
                     .padding()
                     .background(.black.opacity(0.8))

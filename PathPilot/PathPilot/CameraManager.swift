@@ -17,7 +17,22 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     @Published var isSessionRunning = false
     @Published var detectedLabel: String = "—"
     @Published var isDetectionEnabled: Bool = true {
-        didSet { detectionEnabledUnsafe = isDetectionEnabled }
+        didSet {
+            detectionEnabledUnsafe = isDetectionEnabled
+            if isDetectionEnabled {
+                if detectedLabel == "Detection paused" {
+                    detectedLabel = "—"
+                }
+                return
+            }
+
+            // Provide immediate visible/audio feedback when detection is stopped.
+            detectedLabel = "Detection paused"
+            stableIdentifier = ""
+            stableCount = 0
+            isDetecting = false
+            speechManager.stopSpeaking()
+        }
     }
     @Published var isReadingPoster: Bool = false {
         didSet { isReadingPosterUnsafe = isReadingPoster }
@@ -91,10 +106,9 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                 self.session.startRunning()
             }
 
-            let runningNow = self.session.isRunning
             Task { @MainActor in
                 withAnimation(.easeOut(duration: 0.2)) {
-                    self.isSessionRunning = runningNow
+                    self.isSessionRunning = true
                 }
             }
         }

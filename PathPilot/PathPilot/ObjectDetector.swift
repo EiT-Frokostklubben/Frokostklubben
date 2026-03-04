@@ -15,8 +15,31 @@ final class ObjectDetector {
     private let request: VNCoreMLRequest
     private let labels: [String]
     private let inputSize: CGFloat
+    private let isCriticalOnlyMode: Bool
 
-    init?(modelName: String, labels: [String], inputSize: CGFloat = 640) {
+    // COCO can detect these critical classes out of the box.
+    // "door" and "stairs" are not COCO classes and require another model.
+    private static let criticalLabels: Set<String> = [
+        "person",
+        "stop sign",
+        "car",
+        "bus",
+        "truck",
+        "motorcycle",
+        "bicycle"
+    ]
+
+    private static let confidenceThresholdByLabel: [String: Float] = [
+        "person": 0.45,
+        "stop sign": 0.55,
+        "car": 0.5,
+        "bus": 0.5,
+        "truck": 0.5,
+        "motorcycle": 0.5,
+        "bicycle": 0.5
+    ]
+
+    init?(modelName: String, labels: [String], inputSize: CGFloat = 640, isCriticalOnlyMode: Bool = true) {
         guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc"),
               let coreMLModel = try? MLModel(contentsOf: modelURL, configuration: MLModelConfiguration()),
               let visionModel = try? VNCoreMLModel(for: coreMLModel) else {
@@ -27,12 +50,25 @@ final class ObjectDetector {
         self.labels = labels
         self.request = VNCoreMLRequest(model: visionModel)
         self.inputSize = inputSize
+        self.isCriticalOnlyMode = isCriticalOnlyMode
     }
 
     func detect(pixelBuffer: CVPixelBuffer,
                 completion: @escaping (_ detections: [Detection]) -> Void) {
 
-        request.imageCropAndScaleOption = .scaleFill
+        request.imageCropAndScaleOption = .scaleFit
+        let sourceWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+        let sourceHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        guard sourceWidth > 0, sourceHeight > 0 else {
+            completion([])
+            return
+        }
+
+        let scale = min(inputSize / sourceWidth, inputSize / sourceHeight)
+        let scaledWidth = sourceWidth * scale
+        let scaledHeight = sourceHeight * scale
+        let padX = (inputSize - scaledWidth) * 0.5
+        let padY = (inputSize - scaledHeight) * 0.5
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
         do {
@@ -49,7 +85,7 @@ final class ObjectDetector {
             return
         }
 
-        let confidenceThreshold: Float = 0.4
+        let confidenceThreshold: Float = 0.5
         let nmsThreshold: Float = 0.45
 
         let numPredictions = multiArray.shape[2].intValue
@@ -70,23 +106,35 @@ final class ObjectDetector {
                 }
             }
 
-            guard bestScore >= confidenceThreshold, bestClass >= 0 else { continue }
+            guard bestClass >= 0 else { continue }
+
+            let label = bestClass < labels.count ? labels[bestClass] : "class_\(bestClass)"
+            let normalizedLabel = label.lowercased()
+            if isCriticalOnlyMode && !Self.criticalLabels.contains(normalizedLabel) { continue }
+            let requiredConfidence = Self.confidenceThresholdByLabel[normalizedLabel] ?? confidenceThreshold
+            guard bestScore >= requiredConfidence else { continue }
 
             let cx = multiArray[[0, 0, NSNumber(value: i)]].floatValue
             let cy = multiArray[[0, 1, NSNumber(value: i)]].floatValue
             let w = multiArray[[0, 2, NSNumber(value: i)]].floatValue
             let h = multiArray[[0, 3, NSNumber(value: i)]].floatValue
 
-            let x = CGFloat(cx - w / 2) / inputSize
-            let y = CGFloat(cy - h / 2) / inputSize
-            let width = CGFloat(w) / inputSize
-            let height = CGFloat(h) / inputSize
+            let modelX = CGFloat(cx - w / 2)
+            let modelY = CGFloat(cy - h / 2)
+            let modelWidth = CGFloat(w)
+            let modelHeight = CGFloat(h)
+
+            // Convert from scale-fit model coordinates (with letterbox padding)
+            // back to normalized source-image coordinates.
+            let x = (modelX - padX) / scaledWidth
+            let y = (modelY - padY) / scaledHeight
+            let width = modelWidth / scaledWidth
+            let height = modelHeight / scaledHeight
 
             let rect = CGRect(x: x, y: y, width: width, height: height).standardized
             let clamped = rect.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
             if clamped.isNull || clamped.width <= 0 || clamped.height <= 0 { continue }
 
-            let label = bestClass < labels.count ? labels[bestClass] : "class_\(bestClass)"
             let area = Float(clamped.width * clamped.height)
             candidates.append(Detection(label: label, confidence: bestScore, bbox: clamped, area: area))
         }

@@ -16,76 +16,89 @@ struct ContentView: View {
             CameraPreview(session: camera.session)
                 .ignoresSafeArea()
 
-            // Top overlays: detected label + test sound
             VStack {
-                HStack(alignment: .top) {
-                    // Detected label (top-left)
+                HStack {
                     Text(camera.detectedLabel)
-                        .padding(10)
-                        .background(.black.opacity(0.7))
+                        .font(.title3.weight(.semibold))
+                        .padding(12)
+                        .background(.black.opacity(0.8))
                         .foregroundStyle(.white)
-                        .cornerRadius(12)
+                        .cornerRadius(14)
                         .padding(.leading, 12)
                         .padding(.top, 12)
                         .accessibilityLabel("Detected object")
                         .accessibilityValue(camera.detectedLabel)
-
                     Spacer()
-
-                    // Controls (top-right)
-                    HStack(spacing: 8) {
-                        Button(camera.isDetectionEnabled ? "Stop" : "Start") {
-                            camera.isDetectionEnabled.toggle()
-                        }
-                        .padding(10)
-                        .background(.black.opacity(0.7))
-                        .foregroundStyle(.white)
-                        .cornerRadius(12)
-                        .accessibilityLabel(camera.isDetectionEnabled ? "Stop detection" : "Start detection")
-                        .accessibilityHint("Toggles real time object detection")
-
-                        Button("Read Poster") {
-                            camera.readPoster()
-                        }
-                        .padding(10)
-                        .background(.black.opacity(0.7))
-                        .foregroundStyle(.white)
-                        .cornerRadius(12)
-                        .accessibilityLabel("Read poster")
-                        .accessibilityHint("Captures and reads text aloud")
-
-                        Button("Test Sound") {
-                            camera.testSpeak()
-                        }
-                        .padding(10)
-                        .background(.black.opacity(0.7))
-                        .foregroundStyle(.white)
-                        .cornerRadius(12)
-                        .accessibilityLabel("Test sound")
-                        .accessibilityHint("Plays a short audio message")
-                    }
-                    .padding(.trailing, 12)
-                    .padding(.top, 12)
                 }
 
                 Spacer()
 
                 if camera.isReadingPoster {
-                    Text("Reading poster…")
-                        .padding(12)
-                        .background(.black.opacity(0.7))
-                        .foregroundStyle(.white)
-                        .cornerRadius(12)
-                        .padding(.bottom, 24)
-                        .accessibilityLabel("Reading poster")
+                    ZStack {
+                        GeometryReader { geometry in
+                            let width = geometry.size.width * 0.76
+                            let height = geometry.size.height * 0.76
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(Color.white, style: StrokeStyle(lineWidth: 2, dash: [8]))
+                                .frame(width: width, height: height)
+                                .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                        }
+                        .ignoresSafeArea()
+
+                        Text("Reading poster… align text inside the box")
+                            .padding(12)
+                            .background(.black.opacity(0.8))
+                            .foregroundStyle(.white)
+                            .cornerRadius(12)
+                            .padding(.bottom, 10)
+                            .accessibilityLabel("Reading poster")
+                    }
                 }
+
+                // Bottom dock
+                HStack(spacing: 12) {
+                    Button(camera.isDetectionEnabled ? "Stop" : "Start") {
+                        camera.isDetectionEnabled.toggle()
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 60)
+                    .background(.black.opacity(0.85))
+                    .foregroundStyle(.white)
+                    .font(.title3.weight(.semibold))
+                    .cornerRadius(16)
+                    .accessibilityLabel(camera.isDetectionEnabled ? "Stop detection" : "Start detection")
+                    .accessibilityHint("Toggles real time object detection")
+
+                    Button("Read Poster") {
+                        camera.readPoster()
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 60)
+                    .background(.black.opacity(0.85))
+                    .foregroundStyle(.white)
+                    .font(.title3.weight(.semibold))
+                    .cornerRadius(16)
+                    .accessibilityLabel("Read poster")
+                    .accessibilityHint("Captures and reads text aloud")
+
+                    Button("Test Sound") {
+                        camera.testSpeak()
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 60)
+                    .background(.black.opacity(0.85))
+                    .foregroundStyle(.white)
+                    .font(.title3.weight(.semibold))
+                    .cornerRadius(16)
+                    .accessibilityLabel("Test sound")
+                    .accessibilityHint("Plays a short audio message")
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 24)
             }
 
             // Loading overlay
             if camera.isAuthorized && !camera.isSessionRunning && camera.capturedImage == nil {
                 Text("Starting camera…")
                     .padding()
-                    .background(.black.opacity(0.7))
+                    .background(.black.opacity(0.8))
                     .foregroundStyle(.white)
                     .cornerRadius(12)
                     .padding()
@@ -110,7 +123,7 @@ struct ContentView: View {
                     .accessibilityHint("Allows camera access to start detection")
                 }
                 .padding()
-                .background(.black.opacity(0.7))
+                .background(.black.opacity(0.8))
                 .foregroundStyle(.white)
                 .cornerRadius(16)
                 .padding()
@@ -133,7 +146,7 @@ struct ContentView: View {
                         HStack {
                             Spacer()
                             Button {
-                                camera.posterText = ""
+                                camera.abortPosterRead()
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .font(.system(size: 34))
@@ -162,4 +175,3 @@ struct ContentView: View {
 #Preview {
     ContentView()
 }
-

@@ -10,7 +10,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     @Published var isAuthorized = false
     @Published var capturedImage: UIImage? = nil
@@ -25,19 +25,22 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     @Published var posterText: String = ""
 
     let session = AVCaptureSession()
-    private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
     nonisolated(unsafe) private let detector: ObjectDetector? = ObjectDetector(modelName: "yolov8n", labels: ObjectDetector.cocoLabels)
     private let posterReader = PosterReader()
     private let speechManager = SpeechManager()
 
     nonisolated(unsafe) private var lastClassificationTimeUnsafe = Date.distantPast
-    private let classificationInterval: TimeInterval = 0.55
+    private let classificationInterval: TimeInterval = 0.7
+    nonisolated(unsafe) private var isDetecting: Bool = false
     nonisolated(unsafe) private let detectionQueue = DispatchQueue(label: "detection.queue")
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private var isConfigured = false
     nonisolated(unsafe) private var detectionEnabledUnsafe: Bool = true
     nonisolated(unsafe) private var isReadingPosterUnsafe: Bool = false
+    nonisolated(unsafe) private var pendingPosterReadUnsafe: Bool = false
+    private let isCriticalOnlyMode = true
+    private let posterScanRegion = CGRect(x: 0.12, y: 0.12, width: 0.76, height: 0.76)
 
     // Stability + speech gates
     private var stableIdentifier: String = ""
@@ -47,13 +50,11 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
 
     private let priorityWeights: [String: Float] = [
         "person": 3.0,
-        "car": 2.0,
-        "bus": 2.0,
-        "truck": 1.8,
-        "traffic light": 1.5,
-        "chair": 1.2,
-        "bicycle": 1.2
+        "stop sign": 2.5,
+        "vehicle": 2.0
     ]
+
+    private let maxSpokenObjects = 3
 
     func requestPermissionAndStart() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -121,11 +122,6 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         }
         device.unlockForConfiguration()
 
-        // Add photo output (needed for taking photos)
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
-        }
-
         // Add video output (needed for live classification)
         if session.canAddOutput(videoOutput) {
             videoOutput.alwaysDiscardsLateVideoFrames = true
@@ -137,12 +133,15 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
     
     private func handleDetections(_ detections: [Detection]) {
-        let filtered = detections.filter { priorityWeights.keys.contains($0.label.lowercased()) }
-        guard let top = filtered.max(by: { score($0) < score($1) }) else {
+        let filtered = detections.compactMap { criticalDetection(from: $0) }
+        guard !filtered.isEmpty else {
             stableIdentifier = ""
             stableCount = 0
             return
         }
+
+        let sorted = filtered.sorted { score($0) > score($1) }
+        guard let top = sorted.first else { return }
 
         guard top.area >= minAreaToSpeak else {
             stableIdentifier = ""
@@ -159,15 +158,51 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         }
         guard stableCount >= stableRequiredCount else { return }
 
-        let direction = directionFor(box: top.bbox)
-        let distance = distanceWord(for: top.area)
-        speechManager.speakEvent(label: top.label, direction: direction, distanceWord: distance, area: top.area)
+        let topItems = Array(sorted.prefix(maxSpokenObjects))
+        var phrases: [String] = []
+        phrases.reserveCapacity(topItems.count)
+
+        for item in topItems {
+            let direction = directionFor(box: item.bbox)
+            let distance = distanceWord(for: item.area)
+            let phrase: String
+            if distance.isEmpty {
+                phrase = "\(item.label) \(direction)"
+            } else {
+                phrase = "\(distance) \(item.label) \(direction)"
+            }
+            phrases.append(phrase)
+        }
+
+        speechManager.speakSummary(phrases)
     }
 
     private func score(_ detection: Detection) -> Float {
         let label = detection.label.lowercased()
         let weight = priorityWeights[label] ?? 1.0
         return detection.confidence * detection.area * weight
+    }
+
+    private func criticalDetection(from detection: Detection) -> Detection? {
+        let normalized = detection.label.lowercased()
+        if !isCriticalOnlyMode { return detection }
+
+        let mappedLabel: String
+        switch normalized {
+        case "person", "stop sign", "vehicle":
+            mappedLabel = normalized
+        case "car", "bus", "truck", "motorcycle", "bicycle":
+            mappedLabel = "vehicle"
+        default:
+            return nil
+        }
+
+        return Detection(
+            label: mappedLabel,
+            confidence: detection.confidence,
+            bbox: detection.bbox,
+            area: detection.area
+        )
     }
 
     private func directionFor(box: CGRect) -> String {
@@ -204,77 +239,69 @@ final class CameraManager: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         guard !isReadingPoster else { return }
         isReadingPoster = true
         posterText = "Reading poster..."
-        takePhoto()
+        pendingPosterReadUnsafe = true
     }
 
-
-
-
-    // MARK: - Capture Photo
-
-    func takePhoto() {
-        sessionQueue.async { [weak self] in
-            guard let self else { return }
-            guard self.session.isRunning else { return }
-            guard self.photoOutput.connection(with: .video) != nil else { return }
-
-            let settings = AVCapturePhotoSettings()
-            self.photoOutput.capturePhoto(with: settings, delegate: self)
-        }
+    func abortPosterRead() {
+        pendingPosterReadUnsafe = false
+        isReadingPoster = false
+        posterText = ""
+        speechManager.stopSpeaking()
     }
 
 
     nonisolated func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        if pendingPosterReadUnsafe {
+            pendingPosterReadUnsafe = false
+            detectionQueue.async { [weak self] in
+                guard let self else { return }
+                self.posterReader.read(pixelBuffer: pixelBuffer, regionOfInterest: self.posterScanRegion) { [weak self] text in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        self.posterText = text.isEmpty ? "No text found." : text
+                        self.speechManager.speak(text: self.posterText) { [weak self] in
+                            Task { @MainActor in
+                                self?.posterText = ""
+                            }
+                        }
+                        self.isReadingPoster = false
+                    }
+                }
+            }
+            return
+        }
 
         let now = Date()
         if !detectionEnabledUnsafe || isReadingPosterUnsafe { return }
+        if isDetecting { return }
         if now.timeIntervalSince(lastClassificationTimeUnsafe) < classificationInterval { return }
         lastClassificationTimeUnsafe = now
-
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        isDetecting = true
 
         detectionQueue.async { [weak self] in
             guard let self else { return }
             guard let detector = self.detector else {
                 Task { @MainActor in self.detectedLabel = "No model loaded" }
+                self.isDetecting = false
                 return
             }
 
             detector.detect(pixelBuffer: pixelBuffer) { [weak self] detections in
                 guard let self else { return }
                 Task { @MainActor in
-                    if let top = detections.max(by: { $0.confidence < $1.confidence }) {
+                    let criticalDetections = detections.compactMap { self.criticalDetection(from: $0) }
+                    if let top = criticalDetections.max(by: { $0.confidence < $1.confidence }) {
                         self.detectedLabel = "\(top.label) (\(Int(top.confidence * 100))%)"
                     } else {
                         self.detectedLabel = "—"
                     }
-                    self.handleDetections(detections)
+                    self.handleDetections(criticalDetections)
                 }
-            }
-        }
-    }
-
-    nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
-                     didFinishProcessingPhoto photo: AVCapturePhoto,
-                     error: Error?) {
-        guard error == nil else { return }
-        guard let data = photo.fileDataRepresentation(),
-              let image = UIImage(data: data) else { return }
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.capturedImage = image
-            if self.isReadingPoster {
-                self.posterReader.read(image: image) { [weak self] text in
-                    guard let self else { return }
-                    Task { @MainActor in
-                        self.posterText = text.isEmpty ? "No text found." : text
-                        self.speechManager.speak(text: self.posterText)
-                        self.isReadingPoster = false
-                    }
-                }
+                self.isDetecting = false
             }
         }
     }

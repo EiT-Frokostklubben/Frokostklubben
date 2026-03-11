@@ -8,6 +8,7 @@ final class PosterReader {
     private let minimumHeight: CGFloat = 0.03
     private let minimumWordCharacters = 3
     private let minimumSentenceWords = 2
+    private let maximumHighlights = 6
 
     func read(pixelBuffer: CVPixelBuffer,
               regionOfInterest: CGRect,
@@ -43,7 +44,7 @@ final class PosterReader {
                 return
             }
 
-            let lines = self.posterLines(from: results)
+            let lines = self.posterHighlights(from: results)
             completion(lines.joined(separator: "\n"))
         }
         request.recognitionLevel = .accurate
@@ -58,7 +59,7 @@ final class PosterReader {
         return clamped.isNull ? safe : clamped
     }
 
-    private func posterLines(from observations: [VNRecognizedTextObservation]) -> [String] {
+    private func posterHighlights(from observations: [VNRecognizedTextObservation]) -> [String] {
         let candidates = observations.compactMap { observation -> OCRLine? in
             guard let top = observation.topCandidates(1).first else { return nil }
             let normalizedText = normalize(top.string)
@@ -78,14 +79,72 @@ final class PosterReader {
             .filter { !isLikelyKeyboardNoise($0.text) }
             .filter { isLikelyPosterLine($0.text) }
 
-        let sorted = filtered.sorted {
-            if abs($0.box.midY - $1.box.midY) > 0.02 {
-                return $0.box.midY > $1.box.midY
+        let ranked = deduplicatedLines(filtered)
+            .map { (line: $0, score: importanceScore(for: $0)) }
+            .sorted { lhs, rhs in
+                if abs(lhs.score - rhs.score) > 0.05 {
+                    return lhs.score > rhs.score
+                }
+                return readingOrder(lhs.line, rhs.line)
             }
-            return $0.box.minX < $1.box.minX
+
+        let selected = Array(ranked.prefix(maximumHighlights)).map(\.line)
+        return selected
+            .sorted(by: readingOrder)
+            .map(\.text)
+    }
+
+    private func readingOrder(_ lhs: OCRLine, _ rhs: OCRLine) -> Bool {
+        if abs(lhs.box.midY - rhs.box.midY) > 0.02 {
+            return lhs.box.midY > rhs.box.midY
+        }
+        return lhs.box.minX < rhs.box.minX
+    }
+
+    private func deduplicatedLines(_ lines: [OCRLine]) -> [OCRLine] {
+        var seen = Set<String>()
+        return lines.filter { line in
+            seen.insert(canonicalKey(for: line.text)).inserted
+        }
+    }
+
+    private func canonicalKey(for text: String) -> String {
+        let pieces = text.lowercased().unicodeScalars.compactMap { scalar -> String? in
+            if CharacterSet.alphanumerics.contains(scalar) {
+                return String(scalar)
+            }
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                return " "
+            }
+            return nil
         }
 
-        return sorted.map(\.text)
+        return pieces.joined()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+    }
+
+    private func importanceScore(for line: OCRLine) -> Float {
+        let heightScore = Float(line.box.height) * 4.8
+        let widthScore = Float(line.box.width) * 1.4
+        let topPlacementBonus = Float(max(0, line.box.midY - 0.24)) * 0.9
+        let conciseBonus: Float = line.wordCount <= 7 ? 0.28 : 0
+        let headlineBonus: Float = line.looksLikeHeadline ? 0.22 : 0
+        let largeTextBonus: Float = line.box.height >= 0.07 ? 0.32 : 0
+        let longLinePenalty: Float = line.wordCount > 12 ? 0.55 : 0
+        let numberPenalty: Float = line.numericRatio > 0.45 ? 0.25 : 0
+        let punctuationPenalty: Float = line.symbolRatio > 0.18 ? 0.18 : 0
+
+        return line.confidence
+            + heightScore
+            + widthScore
+            + topPlacementBonus
+            + conciseBonus
+            + headlineBonus
+            + largeTextBonus
+            - longLinePenalty
+            - numberPenalty
+            - punctuationPenalty
     }
 
     private func normalize(_ text: String) -> String {
@@ -145,5 +204,47 @@ private struct OCRLine {
 
     var isNearBottomEdge: Bool {
         box.maxY < 0.15
+    }
+
+    var wordCount: Int {
+        text.split(whereSeparator: \.isWhitespace).count
+    }
+
+    var numericRatio: Double {
+        ratio(for: .decimalDigits)
+    }
+
+    var symbolRatio: Double {
+        let scalars = Array(text.unicodeScalars)
+        guard !scalars.isEmpty else { return 0 }
+        let symbolCount = scalars.filter { scalar in
+            !CharacterSet.alphanumerics.contains(scalar) && !CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }.count
+        return Double(symbolCount) / Double(scalars.count)
+    }
+
+    var looksLikeHeadline: Bool {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return false }
+        if words.count == 1 {
+            return text.count >= 6
+        }
+        if words.count > 8 {
+            return false
+        }
+
+        let capitalizedWords = words.filter { word in
+            guard let scalar = word.unicodeScalars.first else { return false }
+            return CharacterSet.uppercaseLetters.contains(scalar)
+        }
+
+        return Double(capitalizedWords.count) / Double(words.count) >= 0.6
+    }
+
+    private func ratio(for set: CharacterSet) -> Double {
+        let scalars = Array(text.unicodeScalars)
+        guard !scalars.isEmpty else { return 0 }
+        let matching = scalars.filter(set.contains).count
+        return Double(matching) / Double(scalars.count)
     }
 }

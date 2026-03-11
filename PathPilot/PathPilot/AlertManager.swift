@@ -39,6 +39,12 @@ final class AlertManager: NSObject, AVSpeechSynthesizerDelegate {
         speak(text: alert.message)
     }
 
+    func stopSpeaking() {
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+    }
+
     private func triggerHaptics(for urgency: ObstacleUrgency) {
         switch urgency {
         case .low:

@@ -45,18 +45,30 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     @Published var isDetectionEnabled: Bool = true {
         didSet { detectionEnabledUnsafe = isDetectionEnabled }
     }
+    @Published var isPosterModeEnabled: Bool = false {
+        didSet { posterModeEnabledUnsafe = isPosterModeEnabled }
+    }
+    @Published var isReadingPoster: Bool = false {
+        didSet { isReadingPosterUnsafe = isReadingPoster }
+    }
     @Published var detectedLabel: String = "Monitoring path"
     @Published var statusText: String = "Starting camera"
     @Published var activeWarningText: String = "Path clear"
+    @Published var posterText: String = ""
 
     let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
     nonisolated(unsafe) private let detector = ObjectDetector(modelName: "yolov8n", labels: ObjectDetector.cocoLabels)
+    nonisolated(unsafe) private let posterReader = PosterReader()
     private let alertManager = AlertManager()
+    private let speechManager = SpeechManager()
 
     nonisolated(unsafe) private var lastClassificationTimeUnsafe = Date.distantPast
     nonisolated(unsafe) private var isDetecting = false
     nonisolated(unsafe) private var detectionEnabledUnsafe = true
+    nonisolated(unsafe) private var posterModeEnabledUnsafe = false
+    nonisolated(unsafe) private var isReadingPosterUnsafe = false
+    nonisolated(unsafe) private var pendingPosterReadUnsafe = false
 
     nonisolated(unsafe) private let classificationInterval: TimeInterval = 0.45
     nonisolated(unsafe) private let detectionQueue = DispatchQueue(label: "detection.queue")
@@ -68,6 +80,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     private let stableRequiredCount = 2
     private let centerCorridor = 0.22...0.78
     private let strongCorridor = 0.36...0.64
+    private let posterScanRegion = CGRect(x: 0.14, y: 0.18, width: 0.72, height: 0.62)
 
     func requestPermissionAndStart() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -89,21 +102,43 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         }
     }
 
-    func testAlert() {
-        let alert = ObstacleAlert(
-            message: "Obstacle ahead",
-            direction: .center,
-            urgency: .medium
-        )
-        activeWarningText = alert.message
-        alertManager.deliver(alert)
-    }
-
     func toggleDetection() {
         isDetectionEnabled.toggle()
-        statusText = isDetectionEnabled ? "Monitoring path" : "Alerts paused"
-        activeWarningText = isDetectionEnabled ? "Path clear" : "Alerts paused"
-        detectedLabel = isDetectionEnabled ? "Monitoring path" : "Alerts paused"
+        updateStatusForCurrentMode()
+    }
+
+    func startPosterMode() {
+        guard !isReadingPoster else { return }
+        stableAlertKey = ""
+        stableAlertCount = 0
+        pendingPosterReadUnsafe = false
+        posterText = ""
+        isPosterModeEnabled = true
+        alertManager.stopSpeaking()
+        speechManager.stopSpeaking()
+        updateStatusForCurrentMode()
+    }
+
+    func scanPoster() {
+        guard isPosterModeEnabled, !isReadingPoster else { return }
+        pendingPosterReadUnsafe = true
+        posterText = ""
+        alertManager.stopSpeaking()
+        speechManager.stopSpeaking()
+        isReadingPoster = true
+        updateStatusForCurrentMode()
+    }
+
+    func abortPosterRead() {
+        pendingPosterReadUnsafe = false
+        posterText = ""
+        isReadingPoster = false
+        isPosterModeEnabled = false
+        stableAlertKey = ""
+        stableAlertCount = 0
+        alertManager.stopSpeaking()
+        speechManager.stopSpeaking()
+        updateStatusForCurrentMode()
     }
 
     private func startSession() {
@@ -129,6 +164,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                     self.isSessionRunning = runningNow
                     self.statusText = runningNow ? "Monitoring path" : "Camera unavailable"
                     self.activeWarningText = "Path clear"
+                    self.detectedLabel = runningNow ? "Monitoring path" : "Camera unavailable"
                 }
             }
         }
@@ -165,6 +201,8 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     }
 
     private func handleDetections(_ detections: [Detection]) {
+        guard !isPosterModeEnabled, !isReadingPoster else { return }
+
         guard let bestAlert = bestAlert(from: detections) else {
             stableAlertKey = ""
             stableAlertCount = 0
@@ -209,6 +247,39 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             direction: top.direction,
             urgency: top.urgency
         )
+    }
+
+    private func updateStatusForCurrentMode() {
+        if isReadingPoster {
+            statusText = "Reading poster"
+            activeWarningText = "Scanning for important text"
+            detectedLabel = "Scanning poster or paper"
+            return
+        }
+
+        if isPosterModeEnabled, !posterText.isEmpty {
+            statusText = "Poster highlights ready"
+            activeWarningText = "Review important text"
+            detectedLabel = "Poster highlights"
+            return
+        }
+
+        if isPosterModeEnabled {
+            statusText = "Poster mode ready"
+            activeWarningText = "Align poster inside frame"
+            detectedLabel = "Ready to scan poster"
+            return
+        }
+
+        if isDetectionEnabled {
+            statusText = "Monitoring path"
+            activeWarningText = "Path clear"
+            detectedLabel = "Monitoring path"
+        } else {
+            statusText = "Alerts paused"
+            activeWarningText = "Alerts paused"
+            detectedLabel = "Alerts paused"
+        }
     }
 
     private func obstacleCandidate(from detection: Detection) -> ObstacleCandidate? {
@@ -276,8 +347,29 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                                    from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        if pendingPosterReadUnsafe {
+            pendingPosterReadUnsafe = false
+
+            detectionQueue.async { [weak self] in
+                guard let self else { return }
+
+                self.posterReader.read(pixelBuffer: pixelBuffer, regionOfInterest: self.posterScanRegion) { [weak self] text in
+                    guard let self else { return }
+                    let highlights = text.isEmpty ? "No important text found." : text
+
+                    Task { @MainActor in
+                        self.posterText = highlights
+                        self.isReadingPoster = false
+                        self.updateStatusForCurrentMode()
+                        self.speechManager.speak(text: highlights)
+                    }
+                }
+            }
+            return
+        }
+
         let now = Date()
-        if !detectionEnabledUnsafe { return }
+        if !detectionEnabledUnsafe || posterModeEnabledUnsafe || isReadingPosterUnsafe { return }
         if isDetecting { return }
         if now.timeIntervalSince(lastClassificationTimeUnsafe) < classificationInterval { return }
         lastClassificationTimeUnsafe = now

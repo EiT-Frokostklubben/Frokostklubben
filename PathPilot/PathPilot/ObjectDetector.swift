@@ -19,27 +19,37 @@ final class ObjectDetector {
 
     // COCO can detect these critical classes out of the box.
     // "door" and "stairs" are not COCO classes and require another model.
-    private static let criticalLabels: Set<String> = [
+    nonisolated private static let criticalLabels: Set<String> = [
         "person",
         "stop sign",
         "car",
         "bus",
         "truck",
         "motorcycle",
-        "bicycle"
+        "bicycle",
+        "chair",
+        "bench",
+        "couch",
+        "potted plant",
+        "fire hydrant"
     ]
 
-    private static let confidenceThresholdByLabel: [String: Float] = [
+    nonisolated private static let confidenceThresholdByLabel: [String: Float] = [
         "person": 0.45,
         "stop sign": 0.55,
         "car": 0.5,
         "bus": 0.5,
         "truck": 0.5,
         "motorcycle": 0.5,
-        "bicycle": 0.5
+        "bicycle": 0.5,
+        "chair": 0.45,
+        "bench": 0.45,
+        "couch": 0.45,
+        "potted plant": 0.45,
+        "fire hydrant": 0.45
     ]
 
-    init?(modelName: String, labels: [String], inputSize: CGFloat = 640, isCriticalOnlyMode: Bool = true) {
+    nonisolated init?(modelName: String, labels: [String], inputSize: CGFloat = 640, isCriticalOnlyMode: Bool = true) {
         guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc"),
               let coreMLModel = try? MLModel(contentsOf: modelURL, configuration: MLModelConfiguration()),
               let visionModel = try? VNCoreMLModel(for: coreMLModel) else {
@@ -53,8 +63,8 @@ final class ObjectDetector {
         self.isCriticalOnlyMode = isCriticalOnlyMode
     }
 
-    func detect(pixelBuffer: CVPixelBuffer,
-                completion: @escaping (_ detections: [Detection]) -> Void) {
+    nonisolated func detect(pixelBuffer: CVPixelBuffer,
+                            completion: @escaping (_ detections: [Detection]) -> Void) {
 
         request.imageCropAndScaleOption = .scaleFit
         let sourceWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
@@ -143,7 +153,7 @@ final class ObjectDetector {
         completion(finalDetections)
     }
 
-    private func nonMaxSuppression(detections: [Detection], iouThreshold: Float) -> [Detection] {
+    nonisolated private func nonMaxSuppression(detections: [Detection], iouThreshold: Float) -> [Detection] {
         let sorted = detections.sorted { $0.confidence > $1.confidence }
         var kept: [Detection] = []
         var suppressed = Array(repeating: false, count: sorted.count)
@@ -163,7 +173,7 @@ final class ObjectDetector {
         return kept
     }
 
-    private func iou(_ a: CGRect, _ b: CGRect) -> Float {
+    nonisolated private func iou(_ a: CGRect, _ b: CGRect) -> Float {
         let intersection = a.intersection(b)
         if intersection.isNull { return 0 }
         let interArea = intersection.width * intersection.height
@@ -172,7 +182,7 @@ final class ObjectDetector {
         return Float(interArea / unionArea)
     }
 
-    static let cocoLabels: [String] = [
+    nonisolated static let cocoLabels: [String] = [
         "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
         "fire hydrant","stop sign","parking meter","bench","bird","cat","dog","horse","sheep","cow",
         "elephant","bear","zebra","giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",

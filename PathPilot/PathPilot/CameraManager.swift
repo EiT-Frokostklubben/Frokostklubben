@@ -6,62 +6,74 @@
 //
 
 import AVFoundation
-import SwiftUI
 import Combine
+import SwiftUI
+
+enum ObstacleDirection: String {
+    case left
+    case center
+    case right
+
+    var spokenPhrase: String {
+        switch self {
+        case .left:
+            return "left"
+        case .center:
+            return "ahead"
+        case .right:
+            return "right"
+        }
+    }
+}
+
+enum ObstacleUrgency: Int {
+    case low
+    case medium
+    case high
+}
+
+struct ObstacleAlert {
+    let message: String
+    let direction: ObstacleDirection
+    let urgency: ObstacleUrgency
+}
 
 @MainActor
 final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-
     @Published var isAuthorized = false
-    @Published var capturedImage: UIImage? = nil
     @Published var isSessionRunning = false
-    @Published var detectedLabel: String = "—"
     @Published var isDetectionEnabled: Bool = true {
         didSet { detectionEnabledUnsafe = isDetectionEnabled }
     }
-    @Published var isReadingPoster: Bool = false {
-        didSet { isReadingPosterUnsafe = isReadingPoster }
-    }
-    @Published var posterText: String = ""
+    @Published var detectedLabel: String = "Monitoring path"
+    @Published var statusText: String = "Starting camera"
+    @Published var activeWarningText: String = "Path clear"
 
     let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    nonisolated(unsafe) private let detector: ObjectDetector? = ObjectDetector(modelName: "yolov8n", labels: ObjectDetector.cocoLabels)
-    private let posterReader = PosterReader()
-    private let speechManager = SpeechManager()
+    nonisolated(unsafe) private let detector = ObjectDetector(modelName: "yolov8n", labels: ObjectDetector.cocoLabels)
+    private let alertManager = AlertManager()
 
     nonisolated(unsafe) private var lastClassificationTimeUnsafe = Date.distantPast
-    private let classificationInterval: TimeInterval = 0.7
-    nonisolated(unsafe) private var isDetecting: Bool = false
+    nonisolated(unsafe) private var isDetecting = false
+    nonisolated(unsafe) private var detectionEnabledUnsafe = true
+
+    nonisolated(unsafe) private let classificationInterval: TimeInterval = 0.45
     nonisolated(unsafe) private let detectionQueue = DispatchQueue(label: "detection.queue")
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private var isConfigured = false
-    nonisolated(unsafe) private var detectionEnabledUnsafe: Bool = true
-    nonisolated(unsafe) private var isReadingPosterUnsafe: Bool = false
-    nonisolated(unsafe) private var pendingPosterReadUnsafe: Bool = false
-    private let isCriticalOnlyMode = true
-    private let posterScanRegion = CGRect(x: 0.12, y: 0.12, width: 0.76, height: 0.76)
 
-    // Stability + speech gates
-    private var stableIdentifier: String = ""
-    private var stableCount: Int = 0
+    private var stableAlertKey = ""
+    private var stableAlertCount = 0
     private let stableRequiredCount = 2
-    private let minAreaToSpeak: Float = 0.02
-
-    private let priorityWeights: [String: Float] = [
-        "person": 3.0,
-        "stop sign": 2.5,
-        "vehicle": 2.0
-    ]
-
-    private let maxSpokenObjects = 3
+    private let centerCorridor = 0.22...0.78
+    private let strongCorridor = 0.36...0.64
 
     func requestPermissionAndStart() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             isAuthorized = true
             startSession()
-
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
                 DispatchQueue.main.async {
@@ -71,22 +83,42 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                     }
                 }
             }
-
         default:
             isAuthorized = false
+            statusText = "Camera permission required"
         }
+    }
+
+    func testAlert() {
+        let alert = ObstacleAlert(
+            message: "Obstacle ahead",
+            direction: .center,
+            urgency: .medium
+        )
+        activeWarningText = alert.message
+        alertManager.deliver(alert)
+    }
+
+    func toggleDetection() {
+        isDetectionEnabled.toggle()
+        statusText = isDetectionEnabled ? "Monitoring path" : "Alerts paused"
+        activeWarningText = isDetectionEnabled ? "Path clear" : "Alerts paused"
+        detectedLabel = isDetectionEnabled ? "Monitoring path" : "Alerts paused"
     }
 
     private func startSession() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             Task { @MainActor in
-                self.configureAudioSession()
+                self.alertManager.prepare()
+                self.statusText = "Starting camera"
             }
+
             if !self.isConfigured {
                 self.configureSession()
                 self.isConfigured = true
             }
+
             if !self.session.isRunning {
                 self.session.startRunning()
             }
@@ -95,11 +127,12 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             Task { @MainActor in
                 withAnimation(.easeOut(duration: 0.2)) {
                     self.isSessionRunning = runningNow
+                    self.statusText = runningNow ? "Monitoring path" : "Camera unavailable"
+                    self.activeWarningText = "Path clear"
                 }
             }
         }
     }
-
 
     private func configureSession() {
         session.beginConfiguration()
@@ -122,7 +155,6 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         }
         device.unlockForConfiguration()
 
-        // Add video output (needed for live classification)
         if session.canAddOutput(videoOutput) {
             videoOutput.alwaysDiscardsLateVideoFrames = true
             videoOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "video.frames.queue"))
@@ -131,152 +163,121 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
         session.commitConfiguration()
     }
-    
+
     private func handleDetections(_ detections: [Detection]) {
-        let filtered = detections.compactMap { criticalDetection(from: $0) }
-        guard !filtered.isEmpty else {
-            stableIdentifier = ""
-            stableCount = 0
+        guard let bestAlert = bestAlert(from: detections) else {
+            stableAlertKey = ""
+            stableAlertCount = 0
+            activeWarningText = "Path clear"
+            detectedLabel = "Monitoring path"
             return
         }
 
-        let sorted = filtered.sorted { score($0) > score($1) }
-        guard let top = sorted.first else { return }
-
-        guard top.area >= minAreaToSpeak else {
-            stableIdentifier = ""
-            stableCount = 0
-            return
-        }
-
-        let name = top.label.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if name == stableIdentifier {
-            stableCount += 1
+        let key = "\(bestAlert.direction.rawValue)|\(bestAlert.urgency.rawValue)|\(bestAlert.message)"
+        if key == stableAlertKey {
+            stableAlertCount += 1
         } else {
-            stableIdentifier = name
-            stableCount = 1
-        }
-        guard stableCount >= stableRequiredCount else { return }
-
-        let topItems = Array(sorted.prefix(maxSpokenObjects))
-        var phrases: [String] = []
-        phrases.reserveCapacity(topItems.count)
-
-        for item in topItems {
-            let direction = directionFor(box: item.bbox)
-            let distance = distanceWord(for: item.area)
-            let phrase: String
-            if distance.isEmpty {
-                phrase = "\(item.label) \(direction)"
-            } else {
-                phrase = "\(distance) \(item.label) \(direction)"
-            }
-            phrases.append(phrase)
+            stableAlertKey = key
+            stableAlertCount = 1
         }
 
-        speechManager.speakSummary(phrases)
+        activeWarningText = bestAlert.message
+        detectedLabel = bestAlert.message
+
+        guard stableAlertCount >= stableRequiredCount else { return }
+        alertManager.deliver(bestAlert)
     }
 
-    private func score(_ detection: Detection) -> Float {
-        let label = detection.label.lowercased()
-        let weight = priorityWeights[label] ?? 1.0
-        return detection.confidence * detection.area * weight
-    }
-
-    private func criticalDetection(from detection: Detection) -> Detection? {
-        let normalized = detection.label.lowercased()
-        if !isCriticalOnlyMode { return detection }
-
-        let mappedLabel: String
-        switch normalized {
-        case "person", "stop sign", "vehicle":
-            mappedLabel = normalized
-        case "car", "bus", "truck", "motorcycle", "bicycle":
-            mappedLabel = "vehicle"
-        default:
+    private func bestAlert(from detections: [Detection]) -> ObstacleAlert? {
+        let candidates = detections.compactMap(obstacleCandidate(from:))
+        guard let top = candidates.max(by: { $0.riskScore < $1.riskScore }) else {
             return nil
         }
 
-        return Detection(
-            label: mappedLabel,
-            confidence: detection.confidence,
-            bbox: detection.bbox,
-            area: detection.area
+        let message: String
+        switch top.urgency {
+        case .high:
+            message = top.direction == .center ? "Stop, obstacle ahead" : "Stop, obstacle \(top.direction.spokenPhrase)"
+        case .medium:
+            message = top.direction == .center ? "Obstacle ahead" : "Obstacle \(top.direction.spokenPhrase)"
+        case .low:
+            message = top.direction == .center ? "Caution ahead" : "Caution \(top.direction.spokenPhrase)"
+        }
+
+        return ObstacleAlert(
+            message: message,
+            direction: top.direction,
+            urgency: top.urgency
         )
     }
 
-    private func directionFor(box: CGRect) -> String {
-        let centerX = box.midX
-        if centerX < 0.33 { return "left" }
-        if centerX > 0.66 { return "right" }
-        return "ahead"
+    private func obstacleCandidate(from detection: Detection) -> ObstacleCandidate? {
+        let label = canonicalLabel(for: detection.label)
+        guard let label else { return nil }
+
+        let direction = direction(for: detection.bbox)
+        let area = detection.area
+        let centerX = detection.bbox.midX
+        let corridorBoost: Float
+
+        if strongCorridor.contains(centerX) {
+            corridorBoost = 1.45
+        } else if centerCorridor.contains(centerX) {
+            corridorBoost = 1.2
+        } else {
+            corridorBoost = 0.9
+        }
+
+        let labelWeight = label == "vehicle" ? Float(1.25) : Float(1.0)
+        let confidenceWeight = max(0.65, detection.confidence)
+        let riskScore = area * corridorBoost * labelWeight * confidenceWeight
+
+        let urgency: ObstacleUrgency
+        if area >= 0.13 || (direction == .center && area >= 0.08) {
+            urgency = .high
+        } else if area >= 0.055 || (direction == .center && area >= 0.035) {
+            urgency = .medium
+        } else if centerCorridor.contains(centerX) && area >= 0.02 {
+            urgency = .low
+        } else {
+            return nil
+        }
+
+        return ObstacleCandidate(
+            label: label,
+            direction: direction,
+            urgency: urgency,
+            riskScore: riskScore
+        )
     }
 
-    private func distanceWord(for area: Float) -> String {
-        if area >= 0.06 { return "very close" }
-        if area >= 0.02 { return "near" }
-        return ""
-    }
-
-
-    
-    //TESTER
-    private func configureAudioSession() {
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
-            try audioSession.setActive(true)
-        } catch {
-            print("AudioSession error:", error)
+    private func canonicalLabel(for label: String) -> String? {
+        switch label.lowercased() {
+        case "person":
+            return "person"
+        case "car", "bus", "truck", "motorcycle", "bicycle":
+            return "vehicle"
+        case "chair", "bench", "couch", "potted plant", "fire hydrant":
+            return "obstacle"
+        default:
+            return nil
         }
     }
-//TEST
-    func testSpeak() {
-        speechManager.speak(text: "Audio test. PathPilot is speaking.")
-    }
 
-    func readPoster() {
-        guard !isReadingPoster else { return }
-        isReadingPoster = true
-        posterText = "Reading poster..."
-        pendingPosterReadUnsafe = true
+    private func direction(for box: CGRect) -> ObstacleDirection {
+        let centerX = box.midX
+        if centerX < 0.36 { return .right }
+        if centerX > 0.64 { return .left }
+        return .center
     }
-
-    func abortPosterRead() {
-        pendingPosterReadUnsafe = false
-        isReadingPoster = false
-        posterText = ""
-        speechManager.stopSpeaking()
-    }
-
 
     nonisolated func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
+                                   didOutput sampleBuffer: CMSampleBuffer,
+                                   from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        if pendingPosterReadUnsafe {
-            pendingPosterReadUnsafe = false
-            detectionQueue.async { [weak self] in
-                guard let self else { return }
-                self.posterReader.read(pixelBuffer: pixelBuffer, regionOfInterest: self.posterScanRegion) { [weak self] text in
-                    guard let self else { return }
-                    Task { @MainActor in
-                        self.posterText = text.isEmpty ? "No text found." : text
-                        self.speechManager.speak(text: self.posterText) { [weak self] in
-                            Task { @MainActor in
-                                self?.posterText = ""
-                            }
-                        }
-                        self.isReadingPoster = false
-                    }
-                }
-            }
-            return
-        }
-
         let now = Date()
-        if !detectionEnabledUnsafe || isReadingPosterUnsafe { return }
+        if !detectionEnabledUnsafe { return }
         if isDetecting { return }
         if now.timeIntervalSince(lastClassificationTimeUnsafe) < classificationInterval { return }
         lastClassificationTimeUnsafe = now
@@ -285,7 +286,10 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         detectionQueue.async { [weak self] in
             guard let self else { return }
             guard let detector = self.detector else {
-                Task { @MainActor in self.detectedLabel = "No model loaded" }
+                Task { @MainActor in
+                    self.detectedLabel = "Model unavailable"
+                    self.statusText = "Detection unavailable"
+                }
                 self.isDetecting = false
                 return
             }
@@ -293,16 +297,17 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
             detector.detect(pixelBuffer: pixelBuffer) { [weak self] detections in
                 guard let self else { return }
                 Task { @MainActor in
-                    let criticalDetections = detections.compactMap { self.criticalDetection(from: $0) }
-                    if let top = criticalDetections.max(by: { $0.confidence < $1.confidence }) {
-                        self.detectedLabel = "\(top.label) (\(Int(top.confidence * 100))%)"
-                    } else {
-                        self.detectedLabel = "—"
-                    }
-                    self.handleDetections(criticalDetections)
+                    self.handleDetections(detections)
                 }
                 self.isDetecting = false
             }
         }
     }
+}
+
+private struct ObstacleCandidate {
+    let label: String
+    let direction: ObstacleDirection
+    let urgency: ObstacleUrgency
+    let riskScore: Float
 }

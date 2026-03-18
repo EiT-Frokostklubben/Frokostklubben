@@ -8,11 +8,14 @@ struct CameraPreview: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.videoPreviewLayer.session = session
-        view.videoPreviewLayer.videoGravity = .resizeAspectFill
+        view.configurePreviewLayer()
         return view
     }
 
-    func updateUIView(_ uiView: PreviewView, context: Context) {}
+    func updateUIView(_ uiView: PreviewView, context: Context) {
+        uiView.videoPreviewLayer.session = session
+        uiView.configurePreviewLayer()
+    }
 }
 
 final class PreviewView: UIView {
@@ -25,5 +28,10 @@ final class PreviewView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         videoPreviewLayer.frame = bounds
+        configurePreviewLayer()
+    }
+
+    func configurePreviewLayer() {
+        videoPreviewLayer.videoGravity = .resizeAspectFill
     }
 }

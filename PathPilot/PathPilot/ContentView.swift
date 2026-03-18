@@ -12,12 +12,22 @@ struct ContentView: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let previewOverscan: CGFloat = 24
+            let safeInsets = geometry.safeAreaInsets
+            let fullScreenWidth = geometry.size.width + safeInsets.leading + safeInsets.trailing
+            let fullScreenHeight = geometry.size.height + safeInsets.top + safeInsets.bottom
+            let previewCenterX = (geometry.size.width + safeInsets.trailing - safeInsets.leading) / 2
+            let previewCenterY = (geometry.size.height + safeInsets.bottom - safeInsets.top) / 2
+
             ZStack {
                 // Camera preview
                 CameraPreview(session: camera.session)
-                    .frame(width: geometry.size.height, height: geometry.size.width)
+                    .frame(
+                        width: fullScreenHeight + previewOverscan,
+                        height: fullScreenWidth + previewOverscan
+                    )
                     .rotationEffect(.degrees(90))
-                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+                    .position(x: previewCenterX, y: previewCenterY)
                     .ignoresSafeArea()
 
                 if camera.isPosterModeEnabled {

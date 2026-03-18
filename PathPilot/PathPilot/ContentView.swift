@@ -35,7 +35,7 @@ struct ContentView: View {
                     .allowsHitTesting(false)
                 }
 
-                if camera.isAuthorized && camera.posterText.isEmpty {
+                if camera.isAuthorized && camera.posterText.isEmpty && !camera.isPosterModeEnabled && !camera.isReadingPoster {
                     statusChip
                         .padding(.top, 18)
                         .padding(.leading, 18)
@@ -185,7 +185,10 @@ struct ContentView: View {
         if !camera.isDetectionEnabled {
             return "pause.circle.fill"
         }
-        if camera.activeWarningText.lowercased().contains("stop") {
+        if isStopWarning {
+            return "hand.raised.fill"
+        }
+        if isObstacleWarning {
             return "exclamationmark.triangle.fill"
         }
         return "figure.walk.motion"
@@ -198,24 +201,36 @@ struct ContentView: View {
         if !camera.isDetectionEnabled {
             return Color.white.opacity(0.72)
         }
-        if camera.activeWarningText.lowercased().contains("stop") {
+        if isStopWarning {
             return Color(red: 1.0, green: 0.63, blue: 0.50)
         }
+        if isObstacleWarning {
+            return Color(red: 1.0, green: 0.82, blue: 0.46)
+        }
         return Color(red: 0.85, green: 0.96, blue: 0.82)
+    }
+
+    private var isStopWarning: Bool {
+        camera.activeWarningText.lowercased().contains("stop")
+    }
+
+    private var isObstacleWarning: Bool {
+        let warningText = camera.activeWarningText.lowercased()
+        return warningText.contains("obstacle") || warningText.contains("caution")
     }
 
     private var posterActionTitle: String {
         if camera.isReadingPoster {
             return "Reading..."
         }
-        return camera.isPosterModeEnabled ? "Scan Poster" : "Read Poster"
+        return "Scan Poster"
     }
 
     private var posterActionHint: String {
         if camera.isPosterModeEnabled {
             return "Captures the poster inside the frame and reads the main text"
         }
-        return "Enters poster reading mode"
+        return "Frames the poster and scans it after a short delay"
     }
 
     private func guideZone(title: String, color: Color) -> some View {
@@ -243,7 +258,7 @@ struct ContentView: View {
         let guideWidth = min(geometry.size.width * 0.76, 560)
         let guideHeight = min(geometry.size.height * 0.58, 420)
 
-        return ZStack(alignment: .bottom) {
+        return ZStack {
             RoundedRectangle(cornerRadius: 28)
                 .stroke(.white.opacity(0.95), style: StrokeStyle(lineWidth: 3, dash: [12, 10]))
                 .frame(width: guideWidth, height: guideHeight)
@@ -252,19 +267,6 @@ struct ContentView: View {
                         .fill(.black.opacity(0.08))
                         .frame(width: guideWidth, height: guideHeight)
                 )
-
-            HStack(spacing: 10) {
-                Image(systemName: "doc.text.viewfinder")
-                    .font(.headline.weight(.semibold))
-                Text(camera.isReadingPoster ? "Scanning poster..." : "Align the poster or paper, then tap Scan Poster")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .background(.black.opacity(0.78))
-            .foregroundStyle(.white)
-            .clipShape(Capsule())
-            .padding(.bottom, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
@@ -281,9 +283,6 @@ struct ContentView: View {
                         Text("Poster Highlights")
                             .font(.title2.weight(.semibold))
                             .foregroundStyle(.white)
-                        Text("Apple Vision OCR kept the most important lines from the poster or paper.")
-                            .font(.footnote.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.75))
                     }
 
                     Spacer()

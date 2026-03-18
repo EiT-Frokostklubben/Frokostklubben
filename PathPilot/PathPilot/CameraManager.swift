@@ -74,6 +74,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
     nonisolated(unsafe) private let detectionQueue = DispatchQueue(label: "detection.queue")
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     private var isConfigured = false
+    private var posterScanTask: Task<Void, Never>?
 
     private var stableAlertKey = ""
     private var stableAlertCount = 0
@@ -112,15 +113,18 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
         stableAlertKey = ""
         stableAlertCount = 0
         pendingPosterReadUnsafe = false
+        posterScanTask?.cancel()
         posterText = ""
         isPosterModeEnabled = true
         alertManager.stopSpeaking()
         speechManager.stopSpeaking()
         updateStatusForCurrentMode()
+        schedulePosterScan()
     }
 
     func scanPoster() {
         guard isPosterModeEnabled, !isReadingPoster else { return }
+        posterScanTask?.cancel()
         pendingPosterReadUnsafe = true
         posterText = ""
         alertManager.stopSpeaking()
@@ -131,6 +135,7 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
 
     func abortPosterRead() {
         pendingPosterReadUnsafe = false
+        posterScanTask?.cancel()
         posterText = ""
         isReadingPoster = false
         isPosterModeEnabled = false
@@ -167,6 +172,24 @@ final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputS
                     self.detectedLabel = runningNow ? "Monitoring path" : "Camera unavailable"
                 }
             }
+        }
+    }
+
+    private func schedulePosterScan() {
+        posterScanTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+
+            guard
+                let self,
+                !Task.isCancelled,
+                self.isPosterModeEnabled,
+                !self.isReadingPoster,
+                self.posterText.isEmpty
+            else {
+                return
+            }
+
+            self.scanPoster()
         }
     }
 
